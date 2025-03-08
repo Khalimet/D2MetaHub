@@ -1,0 +1,209 @@
+const express = require('express');
+const axios = require('axios');
+const sqlite3 = require('sqlite3').verbose();
+const cors = require('cors');
+
+const API_KEY = "e3b1018496f345b7a8b54baee8f0f414"; // Replace with your Bungie API Key
+const app = express();
+const PORT = 3000;
+
+app.use(cors());
+
+// ✅ Connect to SQLite Database
+const db = new sqlite3.Database('./loadouts.db', (err) => {
+    if (err) {
+        console.error("🔥 Error connecting to database:", err.message);
+    } else {
+        console.log("✅ Connected to SQLite database.");
+    }
+});
+
+// ✅ Create Tables (if not exists)
+db.run(`
+    CREATE TABLE IF NOT EXISTS loadouts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        membershipId TEXT NOT NULL,
+        membershipType INTEGER NOT NULL,
+        characterId TEXT NOT NULL,
+        classType TEXT DEFAULT 'Unknown',
+        weapons TEXT DEFAULT '[]',
+        armor TEXT DEFAULT '[]',
+        subclass TEXT DEFAULT '',
+        activityHash INTEGER NOT NULL,
+        activityType TEXT DEFAULT 'Unknown',
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(membershipId, characterId, activityHash)  -- Ensure uniqueness
+    )
+`, (err) => {
+    if (err) {
+        console.error("🔥 Error creating loadouts table:", err.message);
+    } else {
+        console.log("✅ Loadouts table ready.");
+    }
+});
+
+// 🔥 Fetch Recent Activities & Track All Players
+async function fetchRecentActivities() {
+    console.log(`🔍 Fetching recent activities...`);
+
+    try {
+        // ✅ Get Your Profile Data First
+        const profileResponse = await axios.get(
+            `https://www.bungie.net/Platform/Destiny2/1/Profile/4611686018436478031/?components=100`,
+            { headers: { "X-API-Key": API_KEY } }
+        );
+
+        if (!profileResponse.data.Response || !profileResponse.data.Response.profile) {
+            console.log("🚨 No profile data found.");
+            return;
+        }
+
+        // ✅ Get Character IDs
+        const characterIds = profileResponse.data.Response.profile.data.characterIds;
+        console.log(`✅ Found Character IDs: ${JSON.stringify(characterIds)}`);
+
+        let allPlayers = [];
+
+        for (const characterId of characterIds) {
+            console.log(`🔍 Fetching activities for Character ID: ${characterId}`);
+
+            const historyResponse = await axios.get(
+                `https://www.bungie.net/Platform/Destiny2/1/Account/4611686018436478031/Character/${characterId}/Stats/Activities/?count=50`,
+                { headers: { "X-API-Key": API_KEY } }
+            );
+
+            if (!historyResponse.data.Response || !historyResponse.data.Response.activities) {
+                console.log(`🚨 No recent activities found for Character ID: ${characterId}`);
+                continue;
+            }
+
+            const activities = historyResponse.data.Response.activities;
+            console.log(`✅ Found ${activities.length} activities.`);
+
+            for (const activity of activities) {
+                const { activityDetails } = activity;
+                const activityHash = activityDetails.referenceId;
+                const activityType = getActivityType(activityDetails.mode);
+
+                allPlayers.push({ membershipId: "4611686018436478031", characterId, activityHash, activityType });
+            }
+        }
+
+        console.log(`✅ Found ${allPlayers.length} players across all activities.`);
+        await fetchAndStoreLoadouts(allPlayers);
+
+    } catch (error) {
+        console.error("🔥 ERROR Fetching Activities:", error.message);
+    }
+}
+
+// 🔥 Fetch and Store Loadouts for Players
+async function fetchAndStoreLoadouts(players) {
+    console.log(`🔍 Fetching loadouts for ${players.length} players...`);
+    let count = 0;
+
+    for (const player of players) {
+        try {
+            const { membershipId, membershipType = 1, characterId, activityHash, activityType } = player;
+
+            console.log(`🌐 Fetching loadout for: ${membershipId}, Character: ${characterId}`);
+
+            // ✅ Fetch Character Data (Class Type)
+            const characterResponse = await axios.get(
+                `https://www.bungie.net/Platform/Destiny2/${membershipType}/Profile/${membershipId}/Character/${characterId}/?components=200`,
+                { headers: { "X-API-Key": API_KEY } }
+            );
+
+            let classType = "Unknown";
+            if (characterResponse.data.Response && characterResponse.data.Response.character.data) {
+                const classIndex = characterResponse.data.Response.character.data.classType;
+                const classTypes = ["Titan", "Hunter", "Warlock"];
+                classType = classTypes[classIndex] || "Unknown";
+            }
+
+            console.log(`✅ Retrieved Class Type: ${classType}`);
+
+            // ✅ Fetch Character Equipment (Loadout)
+            const equipmentResponse = await axios.get(
+                `https://www.bungie.net/Platform/Destiny2/${membershipType}/Profile/${membershipId}/Character/${characterId}/?components=CharacterEquipment`,
+                { headers: { "X-API-Key": API_KEY } }
+            );
+
+            if (!equipmentResponse.data.Response || !equipmentResponse.data.Response.equipment.data) {
+                console.log(`🚨 No equipment data found for ${membershipId}`);
+                continue;
+            }
+
+            const equippedItems = equipmentResponse.data.Response.equipment.data.items;
+            let weapons = [];
+            let armor = [];
+            let subclass = "";
+
+            for (const item of equippedItems) {
+                const itemHash = item.itemHash;
+                const bucketHash = item.bucketHash;
+
+                if ([1498876634, 2465295065, 953998645].includes(bucketHash)) {
+                    weapons.push(itemHash);
+                } else if ([3448274439, 3551918588, 14239492, 20886954, 1585787867].includes(bucketHash)) {
+                    armor.push(itemHash);
+                } else if (bucketHash === 3284755031) {
+                    subclass = itemHash;
+                }
+            }
+
+            // ✅ Store Loadout in SQLite
+            db.run(`
+                INSERT INTO loadouts (membershipId, membershipType, characterId, classType, weapons, armor, subclass, activityHash, activityType)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(membershipId, characterId, activityHash) DO UPDATE 
+                SET classType=excluded.classType, 
+                    weapons=excluded.weapons, 
+                    armor=excluded.armor, 
+                    subclass=excluded.subclass, 
+                    activityType=excluded.activityType
+            `, [
+                membershipId, membershipType, characterId, classType,
+                JSON.stringify(weapons), JSON.stringify(armor), subclass, activityHash, activityType
+            ], (err) => {
+                if (err) {
+                    console.error("🔥 Error inserting loadout:", err.message);
+                } else {
+                    console.log(`✅ Stored loadout for ${membershipId} in ${activityType}`);
+                }
+            });
+
+            count++;
+            await new Promise(resolve => setTimeout(resolve, 250));
+
+        } catch (error) {
+            console.error(`🔥 ERROR fetching loadout for ${player.membershipId}:`, error.message);
+        }
+    }
+
+    console.log(`✅ Completed! Stored ${count} player loadouts.`);
+}
+
+// ✅ Helper Function: Get Activity Type
+function getActivityType(mode) {
+    const activityTypes = {
+        4: "Raid",
+        82: "Dungeon",
+        5: "Strike",
+        7: "PvP",
+        46: "Nightfall",
+        84: "Gambit",
+        75: "Trials of Osiris"
+    };
+    return activityTypes[mode] || "Unknown";
+}
+
+// ✅ API Routes
+app.get('/track/recent-activities', async (req, res) => {
+    console.log("✅ Received request to /track/recent-activities");
+    await fetchRecentActivities();
+    res.json({ message: "✅ Successfully tracked recent activities!" });
+});
+
+// ✅ Start Server
+app.listen(PORT, () => console.log(`✅ Server running on http://localhost:${PORT}`));
